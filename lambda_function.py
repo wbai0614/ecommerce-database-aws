@@ -1,21 +1,13 @@
-# lambda_function.py (UPDATED)
-# Pipeline:
-# 1) Generate daily raw orders CSV -> upload to S3 (raw/orders/dt=YYYY-MM-DD/orders.csv)
-# 2) Start Glue ETL with required args (including RAW_BUCKET/RAW_PREFIX) -> wait until SUCCEEDED
-# 3) Call Redshift stored procedure: CALL public.sp_load_orders_daily('<RUN_DT>')
-
 import csv
 import os
-import random
 import time
+import random
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import List
 
-import boto3
-
-random.seed(42)
+import boto3  # available by default in AWS Lambda
 
 PAYMENT_METHODS = ["CREDIT_CARD", "PAYPAL", "APPLE_PAY", "GOOGLE_PAY", "BANK_TRANSFER"]
 ORDER_STATUS = ["COMPLETED", "COMPLETED", "COMPLETED", "CANCELLED", "REFUNDED"]  # weighted
@@ -27,7 +19,7 @@ class Config:
     n_customers: int = 10_000
     n_products: int = 500
     s3_bucket: str = ""
-    s3_prefix: str = "raw"
+    s3_prefix: str = "raw"  # raw/...
 
 
 def _ensure_dir(p: Path) -> None:
@@ -42,27 +34,50 @@ def _write_csv(path: Path, header: List[str], rows: List[List[str]]) -> None:
         w.writerows(rows)
 
 
-def _random_timestamp(on_date: date) -> str:
-    hour = random.randint(0, 23)
-    minute = random.randint(0, 59)
-    second = random.randint(0, 59)
+def _random_timestamp(rng: random.Random, on_date: date) -> str:
+    hour = rng.randint(0, 23)
+    minute = rng.randint(0, 59)
+    second = rng.randint(0, 59)
     dt = datetime(on_date.year, on_date.month, on_date.day, hour, minute, second)
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _rng_for_day(day: date) -> random.Random:
+    """
+    Day-specific RNG so each day differs, but is reproducible.
+    Change RANDOM_SEED_BASE env var if you want a different sequence overall.
+    """
+    base = os.environ.get("RANDOM_SEED_BASE", "42")
+    seed_str = f"{base}-{day.isoformat()}"
+    # stable int seed from string
+    seed_int = 0
+    for ch in seed_str:
+        seed_int = (seed_int * 131 + ord(ch)) % (2**32)
+    return random.Random(seed_int)
+
+
 def generate_orders_for_date(cfg: Config, day: date, n_orders: int) -> Path:
+    """
+    Writes a single orders.csv for one day under:
+      /tmp/synthetic_out/orders/dt=YYYY-MM-DD/orders.csv
+    """
+    rng = _rng_for_day(day)
+
     customer_ids = [f"C{i:06d}" for i in range(1, cfg.n_customers + 1)]
     product_ids = [f"P{i:06d}" for i in range(1, cfg.n_products + 1)]
 
     rows: List[List[str]] = []
     for i in range(1, n_orders + 1):
+        # deterministic ID per day (idempotent reruns)
         order_id = f"O{day.strftime('%Y%m%d')}{i:06d}"
-        cust = random.choice(customer_ids)
-        prod = random.choice(product_ids)
-        ts = _random_timestamp(day)
-        qty = random.randint(1, 5)
-        status = random.choice(ORDER_STATUS)
-        pay = random.choice(PAYMENT_METHODS)
+
+        cust = rng.choice(customer_ids)
+        prod = rng.choice(product_ids)
+        ts = _random_timestamp(rng, day)
+        qty = rng.randint(1, 5)
+        status = rng.choice(ORDER_STATUS)
+        pay = rng.choice(PAYMENT_METHODS)
+
         rows.append([order_id, cust, prod, ts, str(qty), status, pay])
 
     out = Path(cfg.out_dir) / "orders" / f"dt={day.isoformat()}" / "orders.csv"
@@ -83,13 +98,16 @@ def upload_to_s3(paths: List[Path], cfg: Config) -> None:
         s3.upload_file(str(p), cfg.s3_bucket, key)
 
 
-def start_glue_job(run_dt: str, raw_bucket: str, raw_prefix: str) -> str:
+def start_glue_job(run_dt: str) -> str:
     glue = boto3.client("glue")
+
     job_name = os.environ["GLUE_JOB_NAME"]
     raw_db = os.environ["RAW_DATABASE"]
-    s3_output_base = os.environ["S3_OUTPUT_BASE"]
+    s3_output_base = os.environ["S3_OUTPUT_BASE"].rstrip("/")
 
-    # IMPORTANT: pass RAW_BUCKET + RAW_PREFIX because your Glue script requires them
+    raw_bucket = os.environ["BUCKET_NAME"]
+    raw_prefix = os.environ.get("S3_PREFIX", "raw").strip("/")
+
     resp = glue.start_job_run(
         JobName=job_name,
         Arguments={
@@ -143,7 +161,7 @@ def redshift_execute(sql: str) -> str:
 def wait_for_redshift(statement_id: str) -> None:
     rsd = boto3.client("redshift-data")
 
-    timeout_sec = int(os.environ.get("RS_WAIT_TIMEOUT_SEC", "600"))
+    timeout_sec = int(os.environ.get("RS_WAIT_TIMEOUT_SEC", "900"))
     poll_sec = int(os.environ.get("RS_POLL_SEC", "2"))
 
     start = time.time()
@@ -159,21 +177,25 @@ def wait_for_redshift(statement_id: str) -> None:
         time.sleep(poll_sec)
 
 
-def load_redshift_for_dt(run_dt: str) -> None:
+def call_redshift_proc(run_dt: str) -> str:
     schema = os.environ.get("REDSHIFT_PROC_SCHEMA", "public")
     proc = os.environ.get("REDSHIFT_PROC_NAME", "sp_load_orders_daily")
     sql = f"CALL {schema}.{proc}('{run_dt}');"
     sid = redshift_execute(sql)
     wait_for_redshift(sid)
+    return sid
 
 
 def lambda_handler(event, context):
+    # Event:
+    #   {} -> uses today's date (UTC)
+    #   {"run_dt": "2026-01-01"} -> run specific date
     run_dt = (event or {}).get("run_dt")
     day = date.fromisoformat(run_dt) if run_dt else date.today()
 
     bucket = os.environ["BUCKET_NAME"]
     daily_orders = int(os.environ.get("DAILY_ORDERS", "1000"))
-    s3_prefix = os.environ.get("S3_PREFIX", "raw").strip("/")
+    s3_prefix = os.environ.get("S3_PREFIX", "raw")
 
     cfg = Config(
         out_dir="/tmp/synthetic_out",
@@ -181,19 +203,21 @@ def lambda_handler(event, context):
         s3_prefix=s3_prefix,
     )
 
+    # 1) Generate + upload raw
     print(f"Generating {daily_orders} orders for dt={day.isoformat()} ...")
     orders_path = generate_orders_for_date(cfg, day, n_orders=daily_orders)
     upload_to_s3([orders_path], cfg)
-
     raw_s3_uri = f"s3://{bucket}/{s3_prefix}/orders/dt={day.isoformat()}/orders.csv"
 
+    # 2) Glue ETL
     print("Starting Glue job...")
-    jr_id = start_glue_job(day.isoformat(), raw_bucket=bucket, raw_prefix=s3_prefix)
+    jr_id = start_glue_job(day.isoformat())
     print(f"Glue JobRunId: {jr_id}")
     wait_for_glue(jr_id)
 
+    # 3) Redshift load via stored procedure
     print("Calling Redshift procedure public.sp_load_orders_daily ...")
-    load_redshift_for_dt(day.isoformat())
+    rs_statement_id = call_redshift_proc(day.isoformat())
 
     curated_s3_uri = f"s3://{bucket}/curated/orders/dt={day.isoformat()}/"
 
@@ -204,6 +228,7 @@ def lambda_handler(event, context):
         "raw_s3_uri": raw_s3_uri,
         "glue_job_run_id": jr_id,
         "curated_s3_uri": curated_s3_uri,
-        "redshift_proc_called": "public.sp_load_orders_daily",
+        "redshift_proc_called": f"{os.environ.get('REDSHIFT_PROC_SCHEMA','public')}.{os.environ.get('REDSHIFT_PROC_NAME','sp_load_orders_daily')}",
+        "redshift_statement_id": rs_statement_id,
         "redshift_loaded": True,
     }

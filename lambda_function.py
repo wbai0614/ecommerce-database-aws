@@ -5,7 +5,7 @@ import random
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Tuple
 
 import boto3  # available by default in AWS Lambda
 
@@ -54,6 +54,54 @@ def _rng_for_day(day: date) -> random.Random:
     for ch in seed_str:
         seed_int = (seed_int * 131 + ord(ch)) % (2**32)
     return random.Random(seed_int)
+
+
+def _clamp(n: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, n))
+
+
+def choose_daily_orders(day: date, rng: random.Random) -> int:
+    """
+    Decide how many orders to generate today.
+
+    Backward-compatible behavior:
+      - If env DAILY_ORDERS is set -> fixed volume.
+
+    Otherwise randomized (but reproducible per day):
+      - DAILY_ORDERS_AVG (default 1000)
+      - DAILY_ORDERS_JITTER_PCT (default 0.20 => +/-20% around base)
+      - DAILY_ORDERS_MIN / DAILY_ORDERS_MAX (optional hard bounds)
+      - DAILY_ORDERS_WEEKEND_MULT (default 0.75 for Sat/Sun)
+    """
+    fixed = os.environ.get("DAILY_ORDERS")
+    if fixed and fixed.strip():
+        return max(1, int(fixed))
+
+    avg = int(os.environ.get("DAILY_ORDERS_AVG", "1000"))
+    jitter_pct = float(os.environ.get("DAILY_ORDERS_JITTER_PCT", "0.20"))
+    weekend_mult = float(os.environ.get("DAILY_ORDERS_WEEKEND_MULT", "0.75"))
+
+    # Weekday effect: Sat/Sun lower volume
+    base = avg
+    if day.weekday() >= 5:  # 5=Sat, 6=Sun
+        base = int(round(avg * weekend_mult))
+
+    # Jitter band around base
+    lo_band = int(round(base * (1.0 - jitter_pct)))
+    hi_band = int(round(base * (1.0 + jitter_pct)))
+    lo_band = max(1, lo_band)
+    hi_band = max(lo_band, hi_band)
+
+    # Optional hard caps
+    env_min = os.environ.get("DAILY_ORDERS_MIN")
+    env_max = os.environ.get("DAILY_ORDERS_MAX")
+    if env_min and env_min.strip():
+        lo_band = max(lo_band, int(env_min))
+    if env_max and env_max.strip():
+        hi_band = min(hi_band, int(env_max))
+        hi_band = max(lo_band, hi_band)
+
+    return rng.randint(lo_band, hi_band)
 
 
 def generate_orders_for_date(cfg: Config, day: date, n_orders: int) -> Path:
@@ -194,14 +242,17 @@ def lambda_handler(event, context):
     day = date.fromisoformat(run_dt) if run_dt else date.today()
 
     bucket = os.environ["BUCKET_NAME"]
-    daily_orders = int(os.environ.get("DAILY_ORDERS", "1000"))
-    s3_prefix = os.environ.get("S3_PREFIX", "raw")
+    s3_prefix = os.environ.get("S3_PREFIX", "raw").strip("/")
 
     cfg = Config(
         out_dir="/tmp/synthetic_out",
         s3_bucket=bucket,
         s3_prefix=s3_prefix,
     )
+
+    # Use a day-seeded RNG for volume so it's reproducible per date
+    day_rng = _rng_for_day(day)
+    daily_orders = choose_daily_orders(day, day_rng)
 
     # 1) Generate + upload raw
     print(f"Generating {daily_orders} orders for dt={day.isoformat()} ...")
@@ -231,4 +282,5 @@ def lambda_handler(event, context):
         "redshift_proc_called": f"{os.environ.get('REDSHIFT_PROC_SCHEMA','public')}.{os.environ.get('REDSHIFT_PROC_NAME','sp_load_orders_daily')}",
         "redshift_statement_id": rs_statement_id,
         "redshift_loaded": True,
+        "volume_mode": "fixed" if os.environ.get("DAILY_ORDERS") else "randomized",
     }
